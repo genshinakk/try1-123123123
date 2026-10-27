@@ -2,7 +2,7 @@
 # NotFunPay — гарант-бот (aiogram 3.x)
 # =====================================================================
 # Запуск:
-#   BOT_TOKEN="ваш_токен" ADMIN_ID="7212994322" python notfunpay_bot_fixed.py
+#   BOT_TOKEN="ваш_токен" ADMIN_ID="ваш_telegram_id" python notfunpay_bot_fixed.py
 #
 # ВНИМАНИЕ (безопасность): токен ниже оставлен как значение по умолчанию,
 # но он был опубликован в переписке и считается скомпрометированным!
@@ -14,15 +14,15 @@ import asyncio
 import os
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
 )
 
 # ================= CONFIG =================
@@ -34,6 +34,20 @@ if not ADMIN_ID_RAW.isdigit():
     raise RuntimeError("Не задан корректный ADMIN_ID. См. инструкцию по запуску.")
 ADMIN_ID = int(ADMIN_ID_RAW)
 DB_PATH = os.getenv("DB_PATH", "guarantor.db")
+
+# Автоочистка: по умолчанию закрытые сделки хранятся 30 дней,
+# проверка выполняется при запуске и далее каждые 6 часов.
+# DEAL_RETENTION_DAYS=0 полностью отключает автоматическое удаление.
+try:
+    DEAL_RETENTION_DAYS = int(os.getenv("DEAL_RETENTION_DAYS", "30"))
+    CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "6"))
+except ValueError as exc:
+    raise RuntimeError("DEAL_RETENTION_DAYS и CLEANUP_INTERVAL_HOURS должны быть целыми числами.") from exc
+if DEAL_RETENTION_DAYS < 0:
+    raise RuntimeError("DEAL_RETENTION_DAYS не может быть отрицательным.")
+if CLEANUP_INTERVAL_HOURS <= 0:
+    raise RuntimeError("CLEANUP_INTERVAL_HOURS должен быть больше нуля.")
+CLEANUP_BATCH_SIZE = 200
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -93,8 +107,6 @@ pending_resolution = {}
 
 # Пользователи, которые сейчас пишут текст отзыва: {user_id: {deal_id, rating}}
 pending_review = {}
-# Анти-спам: (deal_id, uid) -> message_id последней карточки сделки в чате.
-deal_msgs = {}
 FINAL_STATUSES = ("completed", "refunded", "partially_refunded")
 NO_REVIEW_TEXT = "Без комментария"
 
@@ -163,7 +175,6 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
         con.execute("""
             CREATE TABLE IF NOT EXISTS faq (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +192,7 @@ def init_db():
             "refund_amount": "REAL NOT NULL DEFAULT 0",
             "resolved_by": "INTEGER",
             "resolved_at": "TEXT",
+            "closed_at": "TEXT",
         }
         for name, definition in migrations.items():
             if name not in existing:
@@ -231,10 +243,17 @@ def change_status(deal_id, expected, new_status, actor, action):
     """Атомарно меняет статус; при завершении зачисляет продавцу баланс один раз."""
     with closing(connect()) as con:
         con.execute("BEGIN IMMEDIATE")
-        cur = con.execute(
-            "UPDATE deals SET status=? WHERE id=? AND status=?",
-            (new_status, deal_id, expected)
-        )
+        if new_status in FINAL_STATUSES:
+            cur = con.execute(
+                "UPDATE deals SET status=?, closed_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status=?",
+                (new_status, deal_id, expected)
+            )
+        else:
+            cur = con.execute(
+                "UPDATE deals SET status=? WHERE id=? AND status=?",
+                (new_status, deal_id, expected)
+            )
         if cur.rowcount != 1:
             con.rollback()
             return False
@@ -243,6 +262,59 @@ def change_status(deal_id, expected, new_status, actor, action):
             credit_seller_balance(con, deal_id, actor)
         con.commit()
         return True
+
+
+def cleanup_old_deals():
+    """Удаляет старые закрытые сделки и связанный мусор одной транзакцией.
+
+    Балансы и balance_transactions намеренно сохраняются: это финансовая история.
+    Возвращает количество удалённых сделок.
+    """
+    if DEAL_RETENTION_DAYS == 0:
+        return 0
+
+    status_placeholders = ",".join("?" for _ in FINAL_STATUSES)
+    cutoff = f"-{DEAL_RETENTION_DAYS} days"
+    with closing(connect()) as con:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            f"SELECT id FROM deals WHERE status IN ({status_placeholders}) "
+            "AND datetime(COALESCE(closed_at, resolved_at, created_at)) <= datetime('now', ?) "
+            "ORDER BY id LIMIT ?",
+            (*FINAL_STATUSES, cutoff, CLEANUP_BATCH_SIZE)
+        ).fetchall()
+        deal_ids = [row["id"] for row in rows]
+        if not deal_ids:
+            con.rollback()
+            return 0
+
+        id_placeholders = ",".join("?" for _ in deal_ids)
+        con.execute(
+            f"DELETE FROM reviews WHERE deal_id IN ({id_placeholders})",
+            deal_ids
+        )
+        con.execute(
+            f"DELETE FROM audit WHERE deal_id IN ({id_placeholders})",
+            deal_ids
+        )
+        cur = con.execute(
+            f"DELETE FROM deals WHERE id IN ({id_placeholders})",
+            deal_ids
+        )
+        con.commit()
+        return cur.rowcount
+
+
+async def cleanup_worker():
+    """Периодически очищает базу, не блокируя обработку сообщений."""
+    while True:
+        try:
+            deleted = await asyncio.to_thread(cleanup_old_deals)
+            if deleted:
+                print(f"Автоочистка: удалено закрытых сделок: {deleted}")
+        except Exception as exc:
+            print(f"Ошибка автоочистки: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(CLEANUP_INTERVAL_HOURS * 3600)
 
 
 # ================= UI HELPERS =================
@@ -365,33 +437,114 @@ async def admin_only(message):
     return True
 
 
+async def delete_msg(message):
+    """Удаляет сообщение (например, команду пользователя), не падая на ошибках."""
+    try:
+        if message is not None:
+            await message.delete()
+    except Exception:
+        pass
+
+
+def _not_modified(exc) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
+async def safe_edit(message, text, reply_markup=None):
+    """Редактирует сообщение на месте. 'message is not modified' ошибкой не считается."""
+    try:
+        await message.edit_text(text[:MAX_TEXT_LEN], reply_markup=reply_markup)
+        return True
+    except Exception as exc:
+        if _not_modified(exc):
+            return True
+        print(f"safe_edit: {type(exc).__name__}: {exc}")
+        return False
+
+
+# Последние карточки сделок в чатах: {(deal_id, user_id): (chat_id, message_id)}.
+# Позволяет обновлять карточку сделки на месте, а не плодить новые сообщения.
+deal_notifications = {}
+
+
+def track_card(deal_id, uid, message):
+    """Запоминает карточку сделки, чтобы потом обновлять её на месте."""
+    if message is not None:
+        deal_notifications[(deal_id, uid)] = (message.chat.id, message.message_id)
+
+
 async def notify_deal(d, text=None):
-    """Анти-спам: редактируем существующую карточку сделки, а не шлём новую."""
+    """АНТИ-МУСОР: обновляет карточку сделки у участников НА МЕСТЕ (edit_text).
+    Если карточку найти/обновить нельзя — старая удаляется и шлётся новая.
+    В итоге на сделку в чате одна карточка, а не десятки сообщений."""
     content = text or deal_text(d)
+    kb = user_deal_keyboard(d)
     for uid in {d["seller"], d["buyer"]} - {None}:
         key = (d["id"], uid)
-        msg_id = deal_msgs.get(key)
-        edited = False
-        if msg_id is not None:
+        old = deal_notifications.get(key)
+        if old is not None:
+            chat_id, message_id = old
             try:
                 await bot.edit_message_text(
-                    chat_id=uid, message_id=msg_id, text=content,
-                    reply_markup=user_deal_keyboard(d),
+                    content[:MAX_TEXT_LEN], chat_id=chat_id,
+                    message_id=message_id, reply_markup=kb
                 )
-                edited = True
-            except TelegramBadRequest as e:
-                # Текст не изменился (повторный клик) — это не ошибка, молча пропускаем.
-                if "message is not modified" in str(e).lower():
-                    edited = True
-            except Exception:
-                edited = False
-        if not edited:
-            # Карточки ещё нет / её удалили / она слишком старая — шлём новую и запоминаем.
+                if d["status"] in FINAL_STATUSES:
+                    deal_notifications.pop(key, None)
+                continue
+            except Exception as exc:
+                if _not_modified(exc):
+                    continue
+            # Старая карточка недоступна — удаляем её и шлём новую.
             try:
-                msg = await bot.send_message(uid, content, reply_markup=user_deal_keyboard(d))
-                deal_msgs[key] = msg.message_id
+                await bot.delete_message(chat_id, message_id)
             except Exception:
                 pass
+            deal_notifications.pop(key, None)
+        try:
+            msg = await bot.send_message(uid, content[:MAX_TEXT_LEN], reply_markup=kb)
+            deal_notifications[key] = (msg.chat.id, msg.message_id)
+            if d["status"] in FINAL_STATUSES:
+                deal_notifications.pop(key, None)
+        except Exception:
+            pass
+
+
+USER_COMMANDS = [
+    BotCommand(command="start", description="Запустить бота"),
+    BotCommand(command="new", description="Создать сделку"),
+    BotCommand(command="mydeals", description="Мои сделки"),
+    BotCommand(command="deal", description="Показать сделку по номеру"),
+    BotCommand(command="balance", description="Мой баланс"),
+    BotCommand(command="reviews", description="Смотреть отзывы"),
+    BotCommand(command="addreview", description="Оставить отзыв"),
+    BotCommand(command="faq", description="Частые вопросы"),
+    BotCommand(command="help", description="Помощь"),
+]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand(command="admin", description="Панель гаранта"),
+    BotCommand(command="active", description="Активные сделки"),
+    BotCommand(command="disputes", description="Открытые споры"),
+    BotCommand(command="paid", description="Подтвердить оплату: /paid ID"),
+    BotCommand(command="dispute", description="Открыть спор: /dispute ID"),
+    BotCommand(command="refund", description="Отметить возврат: /refund ID"),
+    BotCommand(command="close", description="Закрыть спор: /close ID"),
+    BotCommand(command="history", description="История сделки: /history ID"),
+    BotCommand(command="cleanup", description="Запустить очистку вручную"),
+    BotCommand(command="delreview", description="Удалить отзыв: /delreview ID"),
+    BotCommand(command="addfake", description="Отзыв вручную: /addfake 5 Имя|Текст|время"),
+    BotCommand(command="addfaq", description="Вопрос-ответ: /addfaq Вопрос|Ответ"),
+    BotCommand(command="delfaq", description="Удалить вопрос: /delfaq ID"),
+]
+
+
+async def setup_quick_commands():
+    """Публикует меню команд у пользователей и расширенное меню у гаранта."""
+    await bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(
+        ADMIN_COMMANDS,
+        scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+    )
 
 
 # ================= USER COMMANDS =================
@@ -400,6 +553,8 @@ async def start(message: Message):
     # FIX: message.text/from_user могут отсутствовать (редкие типы апдейтов).
     if not message.from_user or message.text is None:
         return
+    # АНТИ-МУСОР: команду пользователя удаляем, ответ бота остаётся.
+    await delete_msg(message)
     parts = message.text.split(maxsplit=1)
     if len(parts) == 2 and parts[1].startswith("deal_"):
         deal_id = safe_int(parts[1][5:])
@@ -441,10 +596,11 @@ async def start(message: Message):
             con.commit()
 
         d = get_deal(deal_id)
-        await message.answer(
+        msg = await message.answer(
             "Вы присоединились к сделке. Проверьте условия и подтвердите их кнопкой.\n\n"
             + deal_text(d), reply_markup=user_deal_keyboard(d)
         )
+        track_card(deal_id, uid, msg)
         await notify_deal(d)
         return
 
@@ -473,6 +629,7 @@ async def start(message: Message):
     "📜 <b>Команды</b>\n"
     "🛒 Создать сделку: /new 1500 Продажа игрового аккаунта\n"
     "📂 Мои сделки: /mydeals\n"
+    "🔎 Сделка по номеру: /deal ID\n"
     "💰 Мой баланс: /balance\n"
     "⭐ Отзывы: /reviews, оставить отзыв: /addreview\n"
     "ℹ️ Помощь: /help\n\n"
@@ -483,6 +640,7 @@ async def start(message: Message):
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
+    await delete_msg(message)
     text = (
         "🛡️ <b>NotFunPay — гарант-сервис для продажи аккаунтов</b>\n\n"
 
@@ -507,6 +665,7 @@ async def help_command(message: Message):
         "<b>📌 Команды</b>\n"
         "🛒 Создать сделку: /new 1500 Продажа аккаунта\n"
         "📂 Мои сделки: /mydeals\n"
+    "🔎 Сделка по номеру: /deal ID\n"
         "💰 Мой баланс: /balance\n"
         "⭐ Отзывы: /reviews, оставить отзыв: /addreview\n"
         "❓ Частые вопросы: /faq\n"
@@ -520,6 +679,7 @@ async def help_command(message: Message):
 async def new_deal(message: Message):
     if not message.from_user:
         return
+    await delete_msg(message)
     parts = message.text.split(maxsplit=2)
     if len(parts) != 3:
         await message.answer("Формат: /new 1500 Покупка игрового предмета")
@@ -550,16 +710,18 @@ async def new_deal(message: Message):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=deal_{deal_id}"
     d = get_deal(deal_id)
-    await message.answer(
+    msg = await message.answer(
         deal_text(d) + "\n\nОтправь покупателю ссылку:\n" + link +
         "\n\nВажно: оплата ещё не проверена. Не передавайте товар до подтверждения гаранта."
     )
+    track_card(deal_id, message.from_user.id, msg)
 
 
 @dp.message(Command("balance"))
 async def balance_command(message: Message):
     if not message.from_user:
         return
+    await delete_msg(message)
     with closing(connect()) as con:
         row = con.execute("SELECT amount FROM balances WHERE user_id=?", (message.from_user.id,)).fetchone()
         amount = float(row["amount"]) if row else 0.0
@@ -579,6 +741,7 @@ async def balance_command(message: Message):
 async def my_deals(message: Message):
     if not message.from_user:
         return
+    await delete_msg(message)
     with closing(connect()) as con:
         rows = con.execute(
             "SELECT * FROM deals WHERE seller=? OR buyer=? ORDER BY id DESC LIMIT 30",
@@ -593,7 +756,36 @@ async def my_deals(message: Message):
         if not first:
             await asyncio.sleep(0.05)
         first = False
-        await message.answer(deal_text(d), reply_markup=user_deal_keyboard(d))
+        msg = await message.answer(deal_text(d), reply_markup=user_deal_keyboard(d))
+        # АНТИ-МУСОР: запоминаем карточку, чтобы потом обновлять её на месте.
+        if d["status"] not in FINAL_STATUSES:
+            track_card(d["id"], message.from_user.id, msg)
+
+
+@dp.message(Command("deal"))
+async def deal_command(message: Message):
+    """Быстрый просмотр сделки: участникам — своя, гаранту — любая."""
+    if not message.from_user or not message.text:
+        return
+    await delete_msg(message)
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /deal ID")
+        return
+    d = get_deal(int(parts[1]))
+    if not d:
+        await message.answer("Сделка не найдена.")
+        return
+    uid = message.from_user.id
+    if uid != ADMIN_ID and uid not in (d["seller"], d["buyer"]):
+        await message.answer("Нет доступа к этой сделке.")
+        return
+    if uid == ADMIN_ID:
+        await message.answer(deal_text(d), reply_markup=admin_deal_keyboard(d))
+        return
+    msg = await message.answer(deal_text(d), reply_markup=user_deal_keyboard(d))
+    if d["status"] not in FINAL_STATUSES:
+        track_card(d["id"], uid, msg)
 
 
 # ================= REVIEWS =================
@@ -669,6 +861,7 @@ async def add_review(message: Message):
     """Показывает завершённые сделки, по которым можно оставить отзыв."""
     if not message.from_user:
         return
+    await delete_msg(message)
     uid = message.from_user.id
     placeholders = ",".join("?" for _ in FINAL_STATUSES)
     with closing(connect()) as con:
@@ -713,14 +906,16 @@ async def review_choose_deal(callback: CallbackQuery):
         InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rate:{deal_id}:{n}")
         for n in range(1, 6)
     ]])
-    try:
-        await callback.message.edit_text(
-            f"⭐ Отзыв по сделке №{deal_id}\nВыберите оценку:", reply_markup=kb
-        )
-    except TelegramBadRequest:
-        await callback.message.answer(
-            f"⭐ Отзыв по сделке №{deal_id}\nВыберите оценку:", reply_markup=kb
-        )
+    prompt = f"⭐ Отзыв по сделке №{deal_id}\nВыберите оценку:"
+    if (callback.message.text or "").startswith("⭐ Выберите сделку"):
+        # АНТИ-МУСОР: нажали из списка /addreview — редактируем список на месте.
+        await safe_edit(callback.message, prompt, kb)
+    else:
+        # Нажали кнопку на карточке сделки — карточку не трогаем, шлём отдельное сообщение.
+        try:
+            await callback.message.answer(prompt, reply_markup=kb)
+        except Exception:
+            pass
     await callback.answer()
 
 
@@ -739,24 +934,28 @@ async def review_choose_rating(callback: CallbackQuery):
     if error:
         await callback.answer(error, show_alert=True)
         return
-    pending_review[callback.from_user.id] = {"deal_id": deal_id, "rating": rating}
     if callback.message is None:
+        pending_review[callback.from_user.id] = {"deal_id": deal_id, "rating": rating}
         await callback.answer()
         return
+    # АНТИ-МУСОР: запоминаем сообщение с оценкой, чтобы после отправки отзыва
+    # отредактировать его в итоговый ответ, а не слать новое.
+    src = None
     try:
-        await callback.message.edit_text(
-            f"Оценка: {review_stars(rating)} ({rating}/5)\n\n"
-            "Напишите текст отзыва одним сообщением (до 1000 символов).\n"
-            "/skip — отправить только оценку\n"
-            "/cancelreview — отмена"
-        )
-    except TelegramBadRequest:
-        await callback.message.answer(
-            f"Оценка: {review_stars(rating)} ({rating}/5)\n\n"
-            "Напишите текст отзыва одним сообщением (до 1000 символов).\n"
-            "/skip — отправить только оценку\n"
-            "/cancelreview — отмена"
-        )
+        src = (callback.message.chat.id, callback.message.message_id)
+    except AttributeError:
+        src = None
+    pending_review[callback.from_user.id] = {
+        "deal_id": deal_id, "rating": rating, "src": src,
+    }
+    await safe_edit(
+        callback.message,
+        f"Оценка: {review_stars(rating)} ({rating}/5)\n\n"
+        "Напишите текст отзыва одним сообщением (до 1000 символов).\n"
+        "/skip — отправить только оценку\n"
+        "/cancelreview — отмена",
+        None
+    )
     await callback.answer()
 
 
@@ -765,10 +964,22 @@ async def finish_review(message: Message, text):
     if not pending:
         return
     ok, result = save_review(message.from_user, pending["deal_id"], pending["rating"], text)
+    # АНТИ-МУСОР: сообщение пользователя с текстом отзыва удаляем.
+    await delete_msg(message)
+    thanks = "✅ Спасибо! Отзыв опубликован. Все отзывы: /reviews" if ok else f"⛔ {result}"
+    # АНТИ-МУСОР: сообщение с выбором оценки редактируем в итоговый ответ.
+    edited = False
+    src = pending.get("src")
+    if src:
+        try:
+            await bot.edit_message_text(thanks, chat_id=src[0], message_id=src[1])
+            edited = True
+        except Exception:
+            pass
+    if not edited:
+        await message.answer(thanks)
     if not ok:
-        await message.answer(f"⛔ {result}")
         return
-    await message.answer("✅ Спасибо! Отзыв опубликован. Все отзывы: /reviews")
     # Уведомление о новом отзыве получает только гарант
     user = message.from_user
     review_body = "" if text == NO_REVIEW_TEXT else f"\n{text}"
@@ -792,7 +1003,9 @@ async def review_skip(message: Message):
 
 @dp.message(Command("cancelreview"))
 async def review_cancel(message: Message):
-    if message.from_user and pending_review.pop(message.from_user.id, None):
+    cancelled = bool(message.from_user and pending_review.pop(message.from_user.id, None))
+    await delete_msg(message)
+    if cancelled:
         await message.answer("Отзыв отменён.")
 
 
@@ -808,30 +1021,85 @@ async def review_text(message: Message):
     await finish_review(message, text)
 
 
-@dp.message(Command("reviews"))
-async def reviews_command(message: Message):
+REVIEWS_PER_PAGE = 10  # отзывов на страницу в /reviews
+
+
+def build_reviews_page(page, uid):
+    """Собирает страницу отзывов: (text, kb). Листание кнопками, без спама сообщениями."""
     with closing(connect()) as con:
-        rows = con.execute(
-            "SELECT id, author_name, rating, text, created_at FROM reviews "
-            "ORDER BY id DESC LIMIT 20"
-        ).fetchall()
         stats = con.execute(
             "SELECT COUNT(*) AS total, AVG(rating) AS average FROM reviews"
         ).fetchone()
-    if not rows:
-        await message.answer("Отзывов пока нет. Оставить отзыв можно после сделки: /addreview")
-        return
+        rows = con.execute(
+            "SELECT id, author_name, rating, text, created_at FROM reviews "
+            "ORDER BY id DESC LIMIT ? OFFSET ?",
+            (REVIEWS_PER_PAGE, page * REVIEWS_PER_PAGE),
+        ).fetchall()
+    total = stats["total"]
+    if not total:
+        return None, None
+    pages = (total + REVIEWS_PER_PAGE - 1) // REVIEWS_PER_PAGE
+    page = max(0, min(page, pages - 1))
     average = float(stats["average"] or 0)
-    uid = message.from_user.id if message.from_user else 0
-    text = f"⭐ ОТЗЫВЫ NOTFUNPAY\nВсего: {stats['total']} | Средняя оценка: {average:.1f}/5\n"
+    text = (
+        f"⭐ ОТЗЫВЫ NOTFUNPAY\n"
+        f"Всего: {total} | Средняя оценка: {average:.1f}/5\n"
+        f"Страница {page + 1} из {pages}\n"
+    )
     for row in rows:
+        # Подрезаем длинный текст, чтобы страница всегда влезала в лимит Telegram.
+        body = row["text"]
+        if len(body) > 300:
+            body = body[:300] + "…"
         text += (
             f"\n{review_stars(row['rating'])} ({row['rating']}/5) — {row['author_name']}\n"
-            f"{row['text']}\n"
+            f"{body}\n"
             f"🕒 {row['created_at']}"
             + (f" | #{row['id']}" if uid == ADMIN_ID else "") + "\n"
         )
-    await message.answer(text[:MAX_TEXT_LEN])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"revpg:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="revpg:stay"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"revpg:{page + 1}"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[nav])
+    return text, kb
+
+
+@dp.message(Command("reviews"))
+async def reviews_command(message: Message):
+    await delete_msg(message)
+    uid = message.from_user.id if message.from_user else 0
+    text, kb = build_reviews_page(0, uid)
+    if text is None:
+        await message.answer("Отзывов пока нет. Оставить отзыв можно после сделки: /addreview")
+        return
+    await message.answer(text[:MAX_TEXT_LEN], reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("revpg:"))
+async def reviews_page_callback(callback: CallbackQuery):
+    """Листание страниц отзывов кнопками ⬅️ ➡️ — редактируем то же сообщение."""
+    if callback.message is None:
+        await callback.answer()
+        return
+    payload = callback.data.split(":", 1)[1] if callback.data else "0"
+    if payload == "stay":
+        await callback.answer()
+        return
+    page = safe_int(payload) or 0
+    uid = callback.from_user.id if callback.from_user else 0
+    text, kb = build_reviews_page(page, uid)
+    if text is None:
+        await callback.answer("Отзывов нет.", show_alert=True)
+        return
+    if not await safe_edit(callback.message, text, kb):
+        try:
+            await callback.message.answer(text[:MAX_TEXT_LEN], reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
 
 
 @dp.message(Command("delreview"))
@@ -839,6 +1107,7 @@ async def delete_review(message: Message):
     """Модерация для гаранта: /delreview ID"""
     if not await admin_only(message):
         return
+    await delete_msg(message)
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /delreview ID (ID виден в /reviews)")
@@ -848,12 +1117,11 @@ async def delete_review(message: Message):
     await message.answer("🗑 Отзыв удалён." if cur.rowcount else "Отзыв не найден.")
 
 
-# ================= FAKE REVIEWS + FAQ =================
 def fake_time(raw):
     """
     Приводит время из /addfake к формату 'YYYY-MM-DD HH:MM:SS'.
     Понимает:
-      2025-01-15 14:30  /  2025-01-15   — конкретная дата (если не указать время — 00:00)
+      2025-01-15 14:30  /  2025-01-15   — конкретная дата
       30м / 5ч / 2д / 1н                — 'N минут/часов/дней/недель назад'
       пусто                             — None (используем текущее время)
     Возвращает None, если строку не удалось распознать.
@@ -879,60 +1147,71 @@ def fake_time(raw):
 
 
 @dp.message(Command("addfake"))
-async def add_fake(message: Message):
-    """Гарант добавляет фейк-отзыв: /addfake 5 Автор|Текст|время
+async def add_fake_review(message: Message):
+    """Гарант добавляет отзыв вручную: /addfake 5 Имя|Текст|время
     Время необязательно: без него ставится текущее."""
     if not await admin_only(message):
         return
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) != 3 or parts[1] not in {"1", "2", "3", "4", "5"}:
+    await delete_msg(message)
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit():
         await message.answer(
-            "Формат: /addfake 5 Автор|Текст|время\n"
-            "Время (можно опустить): 2025-01-15 14:30 или 30м / 5ч / 2д / 1н"
+            "Формат: /addfake 5 Имя автора|Текст отзыва|время\n"
+            "Время (можно опустить): 2025-01-15 14:30 или 30м / 5ч / 2д / 1н\n\n"
+            "Примеры:\n"
+            "/addfake 5 Алексей|Всё прошло идеально!|3д — трёхдневной давности\n"
+            "/addfake 5 Алексей|Всё прошло идеально! — время сейчас\n"
+            "/addfake 5 Алексей|Всё прошло идеально!|2025-01-15 14:30"
         )
         return
-    head, sep, rest = parts[2].partition("|")
-    text_part, tsep, time_raw = rest.rpartition("|")
-    if not sep:
-        await message.answer("Нужен формат: /addfake 5 Автор|Текст|время (текст не должен содержать |)")
+    rating = int(parts[1])
+    if not 1 <= rating <= 5:
+        await message.answer("Оценка должна быть от 1 до 5.")
         return
-    if tsep:
+    if "|" not in parts[2]:
+        await message.answer("Раздели имя и текст символом |")
+        return
+    head, _, rest = parts[2].partition("|")
+    text_part, tsep, time_raw = rest.rpartition("|")
+    # Последний кусок после | считаем временем ТОЛЬКО если он похож на время.
+    if tsep and fake_time(time_raw) is not None:
         author_name, text, time_str = head, text_part, time_raw
     else:
         author_name, text, time_str = head, rest, None
-    author_name = author_name.strip()[:100]
+    author_name = author_name.strip()[:100] or "Покупатель"
     text = text.strip()[:1000]
-    if not author_name or not text:
-        await message.answer("Автор и текст не могут быть пустыми.")
+    if not text:
+        await message.answer("Текст отзыва пустой.")
         return
     created_at = fake_time(time_str)
-    if time_str and created_at is None:
-        await message.answer(
-            "Не понял время. Примеры: 2025-01-15 14:30, 2025-01-15, 30м, 5ч, 2д, 1н"
-        )
-        return
     if created_at is None:
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(connect()) as con:
+        con.execute("BEGIN IMMEDIATE")
         cur = con.execute(
             "INSERT INTO reviews(author_id, author_name, rating, text, created_at, deal_id, target_id) "
-            "VALUES(0,?,?,?,?,NULL,NULL)",
-            (author_name, int(parts[1]), text, created_at),
+            "VALUES(0, ?, ?, ?, ?, NULL, NULL)",
+            (author_name, rating, text, created_at)
         )
+        con.commit()
     await message.answer(
-        f"✅ Фейк-отзыв добавлен: ID {cur.lastrowid}, время {created_at}. Проверка: /reviews"
+        f"✅ Отзыв добавлен: {review_stars(rating)} — {author_name}\n"
+        f"🕒 Время: {created_at}\n\n{text}"
     )
 
 
+# ================= FAQ (ВОПРОСЫ И ОТВЕТЫ) =================
 @dp.message(Command("faq"))
 async def faq_command(message: Message):
+    """Список частых вопросов. Клик по вопросу показывает ответ на месте."""
     if not message.from_user:
         return
+    await delete_msg(message)
     await show_faq(message, message.from_user.id, edit=False)
 
 
 def faq_menu_keyboard(uid):
-    """Список вопросов с кнопками. Гарант видит ID для /delfaq."""
+    """Кнопки со списком вопросов. Гарант видит ID для /delfaq."""
     with closing(connect()) as con:
         rows = con.execute("SELECT id, question FROM faq ORDER BY id").fetchall()
     if not rows:
@@ -945,19 +1224,16 @@ def faq_menu_keyboard(uid):
 
 
 async def show_faq(target, uid, edit=False):
-    """Отправляет (или редактирует на месте) меню FAQ — анти-спам."""
+    """Отправляет (или редактирует на месте) меню FAQ — без мусора в чате."""
     kb, rows = faq_menu_keyboard(uid)
     if rows:
         text = "❓ ЧАСТЫЕ ВОПРОСЫ\n\nВыберите вопрос:"
     else:
         text = "Вопросов пока нет.\nГарант может добавить: /addfaq Вопрос|Ответ"
     if edit:
-        try:
-            await target.edit_text(text[:MAX_TEXT_LEN], reply_markup=kb)
+        if await safe_edit(target, text, kb):
             return
-        except TelegramBadRequest:
-            pass
-    await target.answer(text[:MAX_TEXT_LEN], reply_markup=kb)
+    await target.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("faq:"))
@@ -980,10 +1256,8 @@ async def faq_callback(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Назад", callback_data="faq:back")
     ]])
-    body = f"❓ {row['question']}\n\n✅ {row['answer']}"[:MAX_TEXT_LEN]
-    try:
-        await callback.message.edit_text(body, reply_markup=kb)
-    except TelegramBadRequest:
+    body = f"❓ {row['question']}\n\n✅ {row['answer']}"
+    if not await safe_edit(callback.message, body, kb):
         await callback.message.answer(body, reply_markup=kb)
     await callback.answer()
 
@@ -993,7 +1267,8 @@ async def add_faq(message: Message):
     """Гарант: /addfaq Вопрос|Ответ"""
     if not await admin_only(message):
         return
-    parts = (message.text or "").split(maxsplit=1)
+    await delete_msg(message)
+    parts = message.text.split(maxsplit=1)
     if len(parts) != 2 or "|" not in parts[1]:
         await message.answer("Формат: /addfaq Вопрос|Ответ")
         return
@@ -1015,13 +1290,15 @@ async def delete_faq(message: Message):
     """Гарант: /delfaq ID (ID виден в /faq)"""
     if not await admin_only(message):
         return
-    parts = (message.text or "").split()
+    await delete_msg(message)
+    parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /delfaq ID (ID виден в /faq)")
         return
     with closing(connect()) as con:
         cur = con.execute("DELETE FROM faq WHERE id=?", (int(parts[1]),))
     await message.answer("🗑 Вопрос удалён." if cur.rowcount else "Вопрос не найден.")
+
 
 
 # ================= USER CALLBACKS =================
@@ -1110,6 +1387,9 @@ async def dispute(callback: CallbackQuery):
     if error:
         await callback.answer(error, show_alert=True)
         return
+    # АНТИ-МУСОР: текущее сообщение превращаем в карточку сделки со спором.
+    if callback.message is not None:
+        await safe_edit(callback.message, deal_text(d), admin_deal_keyboard(d))
     await callback.answer("Спор открыт.")
 
 
@@ -1125,13 +1405,6 @@ async def open_dispute_as_admin(deal_id):
         return None, "Статус изменился; обнови список."
     d = get_deal(deal_id)
     await notify_deal(d, "⚠️ Гарант открыл спор по вашей сделке.\n\n" + deal_text(d))
-    try:
-        await bot.send_message(
-            ADMIN_ID, "⚠️ Спор открыт (гарант).\n\n" + deal_text(d),
-            reply_markup=admin_deal_keyboard(d)
-        )
-    except Exception:
-        pass
     return d, None
 
 
@@ -1139,6 +1412,7 @@ async def open_dispute_as_admin(deal_id):
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     if await admin_only(message):
+        await delete_msg(message)
         await message.answer("🛡 NotFunPay — ПАНЕЛЬ ГАРАНТА\nКомиссия: 0%", reply_markup=admin_menu())
 
 
@@ -1150,6 +1424,7 @@ async def paid_command(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /paid ID")
         return
+    await delete_msg(message)
     await perform_admin_action(message, "paid", int(parts[1]))
 
 
@@ -1161,6 +1436,7 @@ async def close_command(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /close ID")
         return
+    await delete_msg(message)
     await perform_admin_action(message, "close", int(parts[1]))
 
 
@@ -1172,6 +1448,7 @@ async def refund_command(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /refund ID")
         return
+    await delete_msg(message)
     await perform_admin_action(message, "refund", int(parts[1]))
 
 
@@ -1184,6 +1461,7 @@ async def dispute_command(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /dispute ID")
         return
+    await delete_msg(message)
     d, error = await open_dispute_as_admin(int(parts[1]))
     if error:
         await message.answer(error)
@@ -1193,6 +1471,7 @@ async def dispute_command(message: Message):
 
 async def perform_admin_action(message, action, deal_id):
     config = ADMIN_ACTIONS[action]
+    await delete_msg(message)
     d = get_deal(deal_id)
     if not d:
         await message.answer("Сделка не найдена.")
@@ -1212,11 +1491,43 @@ async def perform_admin_action(message, action, deal_id):
         await message.answer("Статус изменился. Проверь сделку ещё раз.")
 
 
+@dp.message(Command("active"))
+async def active_command(message: Message):
+    if not await admin_only(message):
+        return
+    await delete_msg(message)
+    text, kb = admin_deals_list_kb(ADMIN_ACTIVE, "📋 АКТИВНЫЕ СДЕЛКИ")
+    await message.answer(text[:MAX_TEXT_LEN], reply_markup=kb)
+
+
+@dp.message(Command("cleanup"))
+async def cleanup_command(message: Message):
+    """Ручной запуск той же безопасной очистки, что работает по расписанию."""
+    if not await admin_only(message):
+        return
+    await delete_msg(message)
+    if DEAL_RETENTION_DAYS == 0:
+        await message.answer("Автоочистка отключена: DEAL_RETENTION_DAYS=0.")
+        return
+    try:
+        deleted = await asyncio.to_thread(cleanup_old_deals)
+    except Exception as exc:
+        print(f"Ошибка ручной очистки: {type(exc).__name__}: {exc}")
+        await message.answer("Не удалось выполнить очистку. Подробности в консоли.")
+        return
+    await message.answer(
+        f"🧹 Очистка выполнена. Удалено закрытых сделок: {deleted}.\n"
+        f"Срок хранения: {DEAL_RETENTION_DAYS} дн. Балансы и начисления сохранены."
+    )
+
+
 @dp.message(Command("disputes"))
 async def disputes_command(message: Message):
     if not await admin_only(message):
         return
-    await show_admin_deals(message, ("disputed",), "⚠️ ОТКРЫТЫЕ СПОРЫ")
+    await delete_msg(message)
+    text, kb = admin_deals_list_kb(("disputed",), "⚠️ ОТКРЫТЫЕ СПОРЫ")
+    await message.answer(text[:MAX_TEXT_LEN], reply_markup=kb)
 
 
 @dp.message(Command("history"))
@@ -1227,34 +1538,42 @@ async def history_command(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Формат: /history ID")
         return
-    await send_history(message, int(parts[1]))
+    await delete_msg(message)
+    result = build_history(int(parts[1])) or "Сделка не найдена."
+    await message.answer(result)
 
 
-async def show_admin_deals(message, statuses, title):
+def admin_deals_list_kb(statuses, title):
+    """АНТИ-МУСОР: список сделок ОДНИМ сообщением: текст + кнопки перехода к карточке.
+    Вместо кучи сообщений — одно, которое потом ещё и редактируется на месте."""
     placeholders = ",".join("?" for _ in statuses)
     with closing(connect()) as con:
         rows = con.execute(
-            f"SELECT * FROM deals WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT 30",
+            f"SELECT * FROM deals WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT 15",
             statuses
         ).fetchall()
-    await message.answer(title)
     if not rows:
-        await message.answer("Сделок в этом разделе нет.")
-        return
-    first = True
+        return title + "\n\nСделок в этом разделе нет.", None
+    text = title + "\n"
+    kb_rows = []
     for d in rows:
-        # FIX: пауза, чтобы не поймать flood limit Telegram.
-        if not first:
-            await asyncio.sleep(0.05)
-        first = False
-        await message.answer(deal_text(d), reply_markup=admin_deal_keyboard(d))
+        desc_full = (d["description"] or "").replace(chr(10), " ")
+        text += (
+            f"\n№{d['id']} · {d['amount']:.2f} · {STATUSES.get(d['status'], d['status'])}\n"
+            f"{desc_full[:40]}\n"
+        )
+        kb_rows.append([InlineKeyboardButton(
+            text=f"№{d['id']} · {d['amount']:.2f} · {desc_full[:20]}",
+            callback_data=f"panel:deal:{d['id']}"
+        )])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="panel:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
 
-async def send_history(message, deal_id):
+def build_history(deal_id):
     d = get_deal(deal_id)
     if not d:
-        await message.answer("Сделка не найдена.")
-        return
+        return None
     with closing(connect()) as con:
         rows = con.execute(
             "SELECT actor, action, created_at FROM audit WHERE deal_id=? ORDER BY id DESC LIMIT 30",
@@ -1264,8 +1583,7 @@ async def send_history(message, deal_id):
         f"{r['created_at']} | ID {r['actor']} | {r['action']}" for r in rows
     ) or "История пока пуста."
     # FIX: обрезаем итог до безопасной длины (deal_text + 30 строк могли превысить 4096).
-    result = ("🕓 ИСТОРИЯ СДЕЛКИ\n\n" + deal_text(d) + "\n\n" + text)[:MAX_TEXT_LEN]
-    await message.answer(result)
+    return ("🕓 ИСТОРИЯ СДЕЛКИ\n\n" + deal_text(d) + "\n\n" + text)[:MAX_TEXT_LEN]
 
 
 @dp.callback_query(F.data.startswith("panel:"))
@@ -1281,27 +1599,45 @@ async def admin_panel_navigation(callback: CallbackQuery):
         await callback.answer("Некорректные данные.", show_alert=True)
         return
     section = parts[1]
+    # АНТИ-МУСОР: вся навигация по панели редактирует ОДНО сообщение,
+    # а не плодит новые на каждый клик.
     if section == "home":
-        await callback.message.answer("🛡 NotFunPay — ПАНЕЛЬ ГАРАНТА", reply_markup=admin_menu())
+        await safe_edit(callback.message, "🛡 NotFunPay — ПАНЕЛЬ ГАРАНТА\nКомиссия: 0%", admin_menu())
     elif section == "active":
-        await show_admin_deals(callback.message, ADMIN_ACTIVE, "📋 АКТИВНЫЕ СДЕЛКИ")
+        text, kb = admin_deals_list_kb(ADMIN_ACTIVE, "📋 АКТИВНЫЕ СДЕЛКИ")
+        await safe_edit(callback.message, text, kb)
     elif section == "disputes":
-        await show_admin_deals(callback.message, ("disputed",), "⚠️ ОТКРЫТЫЕ СПОРЫ")
+        text, kb = admin_deals_list_kb(("disputed",), "⚠️ ОТКРЫТЫЕ СПОРЫ")
+        await safe_edit(callback.message, text, kb)
     elif section == "logs":
         with closing(connect()) as con:
             rows = con.execute(
                 "SELECT deal_id, actor, action, created_at FROM audit ORDER BY id DESC LIMIT 15"
             ).fetchall()
         if not rows:
-            await callback.message.answer("История пока пуста.")
+            await safe_edit(callback.message, "История пока пуста.", admin_menu())
         else:
             text = "\n".join(
                 f"#{r['deal_id']} | {r['created_at']} | ID {r['actor']} | {r['action']}"
                 for r in rows
             )
-            await callback.message.answer(("🕓 ПОСЛЕДНИЕ ДЕЙСТВИЯ\n\n" + text)[:MAX_TEXT_LEN])
+            await safe_edit(
+                callback.message, ("🕓 ПОСЛЕДНИЕ ДЕЙСТВИЯ\n\n" + text)[:MAX_TEXT_LEN],
+                admin_menu()
+            )
     elif section == "history" and len(parts) == 3 and parts[2].isdigit():
-        await send_history(callback.message, int(parts[2]))
+        result = build_history(int(parts[2])) or "Сделка не найдена."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К сделке", callback_data=f"panel:deal:{parts[2]}")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="panel:home")],
+        ])
+        await safe_edit(callback.message, result, kb)
+    elif section == "deal" and len(parts) == 3 and parts[2].isdigit():
+        d = get_deal(int(parts[2]))
+        if not d:
+            await safe_edit(callback.message, "Сделка не найдена.", admin_menu())
+        else:
+            await safe_edit(callback.message, deal_text(d), admin_deal_keyboard(d))
     else:
         await callback.answer("Неизвестный раздел.")
         return
@@ -1331,12 +1667,14 @@ async def ask_admin_confirmation(callback: CallbackQuery):
         return
     confirm = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"do:{action}:{deal_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="panel:home")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"panel:deal:{deal_id}")],
     ])
-    await callback.message.answer(
+    # АНТИ-МУСОР: подтверждение показываем на месте карточки, а не новым сообщением.
+    await safe_edit(
+        callback.message,
         f"Подтверди: {config['label']}\n\n{deal_text(d)}\n\n"
         "Напоминание: статус не означает, что перевод денег выполнен.",
-        reply_markup=confirm
+        confirm
     )
     await callback.answer()
 
@@ -1364,7 +1702,12 @@ async def execute_admin_action(callback: CallbackQuery):
         return
     if change_status(deal_id, d["status"], config["to_status"], callback.from_user.id, config["audit"]):
         updated = get_deal(deal_id)
-        await callback.message.answer(config["notice"] + "\n\n" + deal_text(updated))
+        # АНТИ-МУСОР: сообщение-подтверждение превращается в обновлённую карточку сделки.
+        await safe_edit(
+            callback.message,
+            config["notice"] + "\n\n" + deal_text(updated),
+            admin_deal_keyboard(updated)
+        )
         await notify_deal(updated, config["notice"] + "\n\n" + deal_text(updated))
         await ask_for_reviews(updated)
         await callback.answer("Статус обновлён.")
@@ -1390,15 +1733,26 @@ async def choose_resolution(callback: CallbackQuery):
     if outcome not in RESOLUTION_LABELS or not d or d["status"] != "disputed":
         await callback.answer("Сделка не найдена или спор уже закрыт.", show_alert=True)
         return
-    pending_resolution[callback.from_user.id] = {"deal_id": deal_id, "outcome": outcome}
+    pending_resolution[callback.from_user.id] = {
+        "deal_id": deal_id, "outcome": outcome, "src": None,
+    }
+    try:
+        pending_resolution[callback.from_user.id]["src"] = (
+            callback.message.chat.id, callback.message.message_id
+        )
+    except AttributeError:
+        pass
     if outcome == "partial":
         prompt = "Отправь сумму возврата и причину одним сообщением. Пример: 500 Частичное выполнение заказа."
     else:
         prompt = "Напиши причину решения одним сообщением."
-    await callback.message.answer(
+    # АНТИ-МУСОР: карточка превращается в приглашение ввода, после ввода станет итогом.
+    await safe_edit(
+        callback.message,
         f"Решение: {RESOLUTION_LABELS[outcome]}\n"
         f"Сделка №{deal_id}, сумма {d['amount']:.2f}\n\n"
-        f"{prompt}\nДля отмены: /canceldecision"
+        f"{prompt}\nДля отмены: /canceldecision",
+        None
     )
     await callback.answer()
 
@@ -1408,6 +1762,7 @@ async def cancel_resolution(message: Message):
     if not await admin_only(message):
         return
     pending_resolution.pop(message.from_user.id, None)
+    await delete_msg(message)
     await message.answer("Ввод решения отменён.")
 
 
@@ -1418,6 +1773,7 @@ async def receive_resolution_reason(message: Message):
     pending = pending_resolution.get(message.from_user.id)
     if not pending:
         return
+    src = pending.get("src")
     if message.text.startswith("/"):
         await message.answer("Заверши ввод решения или отправь /canceldecision.")
         return
@@ -1469,8 +1825,8 @@ async def receive_resolution_reason(message: Message):
             return
         con.execute(
             "UPDATE deals SET status=?, resolution=?, resolution_reason=?, "
-            "refund_amount=?, resolved_by=?, resolved_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND status='disputed'",
+            "refund_amount=?, resolved_by=?, resolved_at=CURRENT_TIMESTAMP, "
+            "closed_at=CURRENT_TIMESTAMP WHERE id=? AND status='disputed'",
             (new_status, outcome, reason, refund_amount, message.from_user.id, deal_id)
         )
         log_action(
@@ -1490,7 +1846,20 @@ async def receive_resolution_reason(message: Message):
         f"\nПричина: {reason}" +
         "\n\nЭто запись решения, а не подтверждение банковского перевода."
     )
-    await message.answer(result)
+    # АНТИ-МУСОР: команду гаранта удаляем, а сообщение-приглашение редактируем в итог.
+    await delete_msg(message)
+    edited = False
+    if src:
+        try:
+            await bot.edit_message_text(
+                result[:MAX_TEXT_LEN], chat_id=src[0], message_id=src[1],
+                reply_markup=admin_deal_keyboard(updated)
+            )
+            edited = True
+        except Exception:
+            pass
+    if not edited:
+        await message.answer(result[:MAX_TEXT_LEN], reply_markup=admin_deal_keyboard(updated))
     await notify_deal(updated, result)
     await ask_for_reviews(updated)
 
@@ -1504,11 +1873,23 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
+    await setup_quick_commands()
     me = await bot.get_me()
     print(f"Бот запущен: @{me.username or 'unknown'}. База данных: {DB_PATH}")
+    if DEAL_RETENTION_DAYS:
+        print(
+            f"Автоочистка: закрытые сделки старше {DEAL_RETENTION_DAYS} дн., "
+            f"проверка каждые {CLEANUP_INTERVAL_HOURS} ч."
+        )
+    else:
+        print("Автоочистка отключена (DEAL_RETENTION_DAYS=0).")
+    cleanup_task = asyncio.create_task(cleanup_worker())
     try:
         await dp.start_polling(bot)
     finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
         # FIX: aiogram сам закрывает сессию после polling — закрываем только если ещё открыта.
         if not bot.session.closed:
             await bot.session.close()
